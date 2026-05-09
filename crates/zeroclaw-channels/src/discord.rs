@@ -6,7 +6,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio_tungstenite::tungstenite::Message;
@@ -19,7 +19,7 @@ use zeroclaw_api::channel::{
 pub struct DiscordChannel {
     bot_token: String,
     guild_id: Option<String>,
-    allowed_users: Vec<String>,
+    allowed_users: Arc<RwLock<Vec<String>>>,
     listen_to_bots: bool,
     mention_only: bool,
     typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
@@ -62,7 +62,7 @@ impl DiscordChannel {
         Self {
             bot_token,
             guild_id,
-            allowed_users,
+            allowed_users: Arc::new(RwLock::new(normalize_discord_allowed_users(allowed_users))),
             listen_to_bots,
             mention_only,
             typing_handles: Mutex::new(HashMap::new()),
@@ -151,7 +151,45 @@ impl DiscordChannel {
     /// Empty list means deny everyone until explicitly configured.
     /// `"*"` means allow everyone.
     fn is_user_allowed(&self, user_id: &str) -> bool {
-        self.allowed_users.iter().any(|u| u == "*" || u == user_id)
+        self.allowed_users
+            .read()
+            .map(|users| is_discord_identity_allowed(&users, user_id))
+            .unwrap_or(false)
+    }
+
+    fn allowed_users_snapshot(&self) -> Vec<String> {
+        self.allowed_users
+            .read()
+            .map(|users| users.clone())
+            .unwrap_or_default()
+    }
+
+    async fn handle_unauthorized_message(&self, author_id: &str, channel_id: &str) {
+        tracing::warn!("Discord: ignoring message from unauthorized user: {author_id}");
+
+        if channel_id.is_empty() {
+            return;
+        }
+
+        if is_discord_identity_allowed_in_persisted_config(author_id).await {
+            tracing::info!(
+                "Discord: suppressing stale pairing prompt because user is now allowlisted in config: {author_id}"
+            );
+            return;
+        }
+
+        let content = format!(
+            "🔐 This bot requires operator approval.\n\nAsk the operator to run this on the ZeroClaw server:\n`zeroclaw channel bind-discord {author_id}`\n\nAfter the operator approves you, send your message again."
+        );
+
+        if let Err(err) =
+            send_discord_message_json(&self.http_client(), &self.bot_token, channel_id, &content)
+                .await
+        {
+            tracing::warn!(
+                "Discord: failed to send unauthorized pairing instructions to channel {channel_id}: {err}"
+            );
+        }
     }
 
     fn bot_user_id_from_token(token: &str) -> Option<String> {
@@ -651,6 +689,43 @@ const BASE64_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstu
 /// Discord rejects longer payloads with `50035 Invalid Form Body`.
 const DISCORD_MAX_MESSAGE_LENGTH: usize = 2000;
 const DISCORD_ACK_REACTIONS: &[&str] = &["⚡️", "🦀", "🙌", "💪", "👌", "👀", "👣"];
+
+fn normalize_discord_identity(value: &str) -> String {
+    value.trim().to_string()
+}
+
+fn normalize_discord_allowed_users(allowed_users: Vec<String>) -> Vec<String> {
+    allowed_users
+        .into_iter()
+        .map(|entry| normalize_discord_identity(&entry))
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
+
+fn is_discord_identity_allowed(allowed_users: &[String], user_id: &str) -> bool {
+    let user_id = normalize_discord_identity(user_id);
+    allowed_users.iter().any(|u| u == "*" || u == &user_id)
+}
+
+async fn is_discord_identity_allowed_in_persisted_config(user_id: &str) -> bool {
+    match zeroclaw_config::schema::Config::load_or_init().await {
+        Ok(config) => config
+            .channels
+            .discord
+            .as_ref()
+            .map(|discord| {
+                let allowed = normalize_discord_allowed_users(discord.allowed_users.clone());
+                is_discord_identity_allowed(&allowed, user_id)
+            })
+            .unwrap_or(false),
+        Err(err) => {
+            tracing::debug!(
+                "Discord: could not re-check persisted allowlist before pairing prompt: {err}"
+            );
+            false
+        }
+    }
+}
 
 /// Split a message into chunks that respect Discord's 2000-character limit.
 /// Tries to split at word boundaries when possible.
@@ -1173,7 +1248,11 @@ impl Channel for DiscordChannel {
 
                     // Sender validation
                     if !self.is_user_allowed(author_id) {
-                        tracing::warn!("Discord: ignoring message from unauthorized user: {author_id}");
+                        let channel_id = d
+                            .get("channel_id")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("");
+                        self.handle_unauthorized_message(author_id, channel_id).await;
                         continue;
                     }
 
@@ -1258,7 +1337,7 @@ impl Channel for DiscordChannel {
                         let reaction_channel = DiscordChannel::new(
                             self.bot_token.clone(),
                             self.guild_id.clone(),
-                            self.allowed_users.clone(),
+                            self.allowed_users_snapshot(),
                             self.listen_to_bots,
                             self.mention_only,
                         );
@@ -1797,6 +1876,14 @@ mod tests {
         let ch = DiscordChannel::new("fake".into(), None, vec!["*".into()], false, false);
         assert!(ch.is_user_allowed("12345"));
         assert!(ch.is_user_allowed("anyone"));
+    }
+
+    #[test]
+    fn allowlist_check_normalizes_runtime_and_requested_ids() {
+        let allowed = normalize_discord_allowed_users(vec![" 12345 ".into(), "".into()]);
+        assert!(is_discord_identity_allowed(&allowed, "12345"));
+        assert!(is_discord_identity_allowed(&allowed, " 12345 "));
+        assert!(!is_discord_identity_allowed(&allowed, "123456"));
     }
 
     #[test]

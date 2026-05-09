@@ -246,6 +246,19 @@ Examples:
         /// Telegram identity to allow (username without '@' or numeric user ID)
         identity: String,
     },
+    /// Bind a Discord user ID into allowlist
+    #[command(long_about = "\
+Bind a Discord user ID into the allowlist.
+
+Adds a Discord numeric user ID to the channel allowlist so the agent \
+will respond to messages from that identity.
+
+Examples:
+  zeroclaw channel bind-discord 123456789012345678")]
+    BindDiscord {
+        /// Discord numeric user ID to allow
+        user_id: String,
+    },
     /// Send a message to a configured channel
     #[command(long_about = "\
 Send a one-off message to a configured channel.

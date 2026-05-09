@@ -2540,6 +2540,7 @@ fn spawn_supervised_listener(
     tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
     initial_backoff_secs: u64,
     max_backoff_secs: u64,
+    shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     spawn_supervised_listener_with_health_interval(
         ch,
@@ -2547,6 +2548,7 @@ fn spawn_supervised_listener(
         initial_backoff_secs,
         max_backoff_secs,
         Duration::from_secs(CHANNEL_HEALTH_HEARTBEAT_SECS),
+        shutdown,
     )
 }
 
@@ -2556,6 +2558,7 @@ fn spawn_supervised_listener_with_health_interval(
     initial_backoff_secs: u64,
     max_backoff_secs: u64,
     health_interval: Duration,
+    shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     let health_interval = if health_interval.is_zero() {
         Duration::from_secs(1)
@@ -2575,9 +2578,14 @@ fn spawn_supervised_listener_with_health_interval(
             let result = {
                 let listen_future = ch.listen(tx.clone());
                 tokio::pin!(listen_future);
+                let shutdown = shutdown.clone();
 
                 loop {
                     tokio::select! {
+                        () = shutdown.cancelled() => {
+                            tracing::info!("Channel {} listener shutting down", ch.name());
+                            return;
+                        }
                         _ = health.tick() => {
                             zeroclaw_runtime::health::mark_component_ok(&component);
                         }
@@ -2612,6 +2620,14 @@ fn spawn_supervised_listener_with_health_interval(
             backoff = backoff.saturating_mul(2).min(max_backoff);
         }
     })
+}
+
+struct CancelOnDrop(CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 fn compute_max_in_flight_messages(channel_count: usize) -> usize {
@@ -4043,6 +4059,10 @@ fn normalize_telegram_identity(value: &str) -> String {
     value.trim().trim_start_matches('@').to_string()
 }
 
+fn normalize_discord_identity(value: &str) -> String {
+    value.trim().to_string()
+}
+
 pub async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<()> {
     let normalized = normalize_telegram_identity(identity);
     if normalized.is_empty() {
@@ -4076,23 +4096,117 @@ pub async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<(
     updated.save().await?;
     println!("✅ Bound Telegram identity: {normalized}");
     println!("   Saved to {}", updated.config_path.display());
+    apply_allowlist_update_runtime(config).await;
+    Ok(())
+}
+
+pub async fn bind_discord_identity(config: &Config, identity: &str) -> Result<()> {
+    let normalized = normalize_discord_identity(identity);
+    if normalized.is_empty() {
+        anyhow::bail!("Discord user ID cannot be empty");
+    }
+
+    let mut updated = config.clone();
+    let Some(discord) = updated.channels.discord.as_mut() else {
+        anyhow::bail!(
+            "Discord channel is not configured. Run `zeroclaw onboard --channels-only` first"
+        );
+    };
+
+    if discord.allowed_users.iter().any(|u| u == "*") {
+        println!(
+            "⚠️ Discord allowlist is currently wildcard (`*`) — binding is unnecessary until you remove '*'."
+        );
+    }
+
+    if discord
+        .allowed_users
+        .iter()
+        .map(|entry| normalize_discord_identity(entry))
+        .any(|entry| entry == normalized)
+    {
+        println!("✅ Discord identity already bound: {normalized}");
+        return Ok(());
+    }
+
+    discord.allowed_users.push(normalized.clone());
+    updated.save().await?;
+    println!("✅ Bound Discord identity: {normalized}");
+    println!("   Saved to {}", updated.config_path.display());
+    apply_allowlist_update_runtime(config).await;
+    Ok(())
+}
+
+async fn apply_allowlist_update_runtime(config: &Config) {
+    match request_daemon_hot_reload(config).await {
+        Ok(true) => {
+            println!("🔄 Reloaded running daemon via /admin/reload. No process restart required.");
+            return;
+        }
+        Ok(false) => {}
+        Err(e) => {
+            eprintln!("⚠️ Allowlist saved, but daemon hot reload failed: {e}");
+        }
+    }
+
     match maybe_restart_managed_daemon_service() {
         Ok(true) => {
-            println!("🔄 Detected running managed daemon service; reloaded automatically.");
+            println!("🔄 Detected running managed daemon service; restarted service as fallback.");
         }
         Ok(false) => {
             println!(
-                "ℹ️ No managed daemon service detected. If `zeroclaw daemon`/`channel start` is already running, restart it to load the updated allowlist."
+                "ℹ️ No daemon hot reload endpoint or managed service detected. If `zeroclaw channel start` is already running standalone, restart that command to load the updated allowlist."
             );
         }
         Err(e) => {
             eprintln!(
-                "⚠️ Allowlist saved, but failed to reload daemon service automatically: {e}\n\
+                "⚠️ Allowlist saved, but failed to reload daemon service fallback: {e}\n\
                  Restart service manually with `zeroclaw service stop && zeroclaw service start`."
             );
         }
     }
-    Ok(())
+}
+
+async fn request_daemon_hot_reload(config: &Config) -> Result<bool> {
+    let host = match config.gateway.host.as_str() {
+        "0.0.0.0" | "[::]" | "::" => "127.0.0.1",
+        other => other,
+    };
+    let prefix = config
+        .gateway
+        .path_prefix
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            if p.starts_with('/') {
+                p.trim_end_matches('/').to_string()
+            } else {
+                format!("/{}", p.trim_end_matches('/'))
+            }
+        })
+        .unwrap_or_default();
+    let url = format!(
+        "http://{host}:{port}{prefix}/admin/reload",
+        port = config.gateway.port
+    );
+
+    let response = match reqwest::Client::new().post(&url).send().await {
+        Ok(response) => response,
+        Err(err) if err.is_connect() || err.is_timeout() => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
+
+    if response.status().is_success() {
+        return Ok(true);
+    }
+    if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        || response.status() == reqwest::StatusCode::NOT_FOUND
+    {
+        return Ok(false);
+    }
+
+    anyhow::bail!("POST {url} returned {}", response.status())
 }
 
 fn maybe_restart_managed_daemon_service() -> Result<bool> {
@@ -5810,6 +5924,8 @@ pub async fn start_channels(
 
     // Single message bus — all channels send messages here
     let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(100);
+    let listener_shutdown = CancellationToken::new();
+    let _listener_shutdown_guard = CancelOnDrop(listener_shutdown.clone());
 
     // Spawn a listener for each channel
     let mut handles = Vec::new();
@@ -5819,6 +5935,7 @@ pub async fn start_channels(
             tx.clone(),
             initial_backoff_secs,
             max_backoff_secs,
+            listener_shutdown.clone(),
         ));
     }
     drop(tx); // Drop our copy so rx closes when all channels stop
@@ -11495,7 +11612,7 @@ This is an example JSON object for profile settings."#;
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
-        let handle = spawn_supervised_listener(channel, tx, 1, 1);
+        let handle = spawn_supervised_listener(channel, tx, 1, 1, CancellationToken::new());
 
         tokio::time::sleep(Duration::from_millis(80)).await;
         drop(rx);
@@ -11532,6 +11649,7 @@ This is an example JSON object for profile settings."#;
             1,
             1,
             Duration::from_millis(20),
+            CancellationToken::new(),
         );
 
         tokio::time::sleep(Duration::from_millis(35)).await;
@@ -11557,6 +11675,36 @@ This is an example JSON object for profile settings."#;
         drop(rx);
         let join = tokio::time::timeout(Duration::from_secs(1), handle).await;
         assert!(join.is_ok(), "listener should stop after channel shutdown");
+        assert!(calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn supervised_listener_stops_when_shutdown_token_is_cancelled() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let channel: Arc<dyn Channel> = Arc::new(BlockUntilClosedChannel {
+            name: "test-supervised-cancel".into(),
+            calls: Arc::clone(&calls),
+        });
+        let shutdown = CancellationToken::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+
+        let handle = spawn_supervised_listener_with_health_interval(
+            channel,
+            tx,
+            1,
+            1,
+            Duration::from_millis(20),
+            shutdown.clone(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        shutdown.cancel();
+
+        let join = tokio::time::timeout(Duration::from_secs(1), handle).await;
+        assert!(
+            join.is_ok(),
+            "listener should stop when supervisor cancellation fires"
+        );
         assert!(calls.load(Ordering::SeqCst) >= 1);
     }
 

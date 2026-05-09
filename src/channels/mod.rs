@@ -66,6 +66,9 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
         crate::ChannelCommands::BindTelegram { identity } => {
             Box::pin(bind_telegram_identity(config, &identity)).await
         }
+        crate::ChannelCommands::BindDiscord { user_id } => {
+            Box::pin(bind_discord_identity(config, &user_id)).await
+        }
         crate::ChannelCommands::Send {
             message,
             channel_id,
